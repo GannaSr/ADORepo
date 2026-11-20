@@ -1,0 +1,489 @@
+# Prompt: Build the Cheque Review web app (Azure App Service)
+
+> How to use: fill in every `{{PLACEHOLDER}}` (DEV environment only), then paste this whole file into Claude Code at the root of an empty repo, or save it as `docs/PROMPT.md` and tell Claude to read it. Delete any section that does not apply.
+
+---
+
+## 1. Your role and the goal
+
+You are a senior Azure engineer building a production-quality web application for a Canadian credit union.
+
+Build the **Cheque Review web app**: a secure internal web app hosted on **Azure App Service**. Staff use it to:
+- review cheques flagged by an automated clearing process,
+- record decisions and feedback,
+- manage the decision policy.
+
+It **reads from and writes to** three data platforms:
+- **Azure SQL Database**: decisions, policy, feedback and audit (the system of record)
+- **Azure Cosmos DB**: evidence documents and model outputs (JSON)
+- **Azure Databricks**: Unity Catalog Delta tables for history, metrics and retraining labels
+
+For now, build and deploy to the **DEV environment only**. Structure the code, infrastructure and pipeline so more environments can be added later without rework.
+
+Work in small, reviewable steps. **Before writing any code, reply with:**
+1. your understanding of the scope,
+2. the questions you need answered (list them; do not guess schemas or names),
+3. a milestone plan (section 14).
+
+Then wait for my confirmation.
+
+---
+
+## 2. DEV environment details (I will fill these in)
+
+| Item | DEV value |
+|---|---|
+| Subscription name / ID | `{{SUBSCRIPTION}}` |
+| Resource group | `{{RESOURCE_GROUP}}` |
+| Region (Canadian regions only) | `{{REGION}}` |
+| App Service plan | `{{APP_SERVICE_PLAN}}` |
+| Web app name | `{{WEB_APP}}` |
+| Azure SQL server / database | `{{SQL_SERVER}}` / `{{SQL_DB}}` |
+| Cosmos DB account / database | `{{COSMOS_ACCOUNT}}` / `{{COSMOS_DB}}` |
+| Cosmos containers (name → partition key) | `{{e.g. evidence → /chequeId}}` |
+| Databricks workspace URL / Azure resource ID | `{{DBX_URL}}` / `{{DBX_RESOURCE_ID}}` |
+| Databricks SQL warehouse (ID / HTTP path) | `{{DBX_WAREHOUSE_ID}}` |
+| Unity Catalog: catalog / schema the app **reads** | `{{CATALOG}}.{{READ_SCHEMA}}` |
+| Unity Catalog: catalog / schema the app **writes** | `{{CATALOG}}.{{WRITE_SCHEMA}}` |
+| Databricks tables to read | `{{e.g. cheque_curated, clearing_history, image_manifest, model_metrics}}` |
+| Databricks tables to write | `{{e.g. reviewer_labels, reviewer_feedback}}` |
+| Storage account / container for cheque images (read-only) | `{{STORAGE_ACCOUNT}}` / `{{IMAGES_CONTAINER}}` |
+| Key Vault | `{{KEY_VAULT}}` |
+| Application Insights / Log Analytics workspace | `{{APP_INSIGHTS}}` / `{{LOG_ANALYTICS}}` |
+| VNet / subnet for App Service VNet integration | `{{VNET}}` / `{{SUBNET_APP}}` |
+| Private endpoint subnet / private DNS zones | `{{SUBNET_PE}}` / `{{DNS_ZONES}}` |
+| Databricks front-end Private Link and DNS zone | `{{DBX_PRIVATE_ENDPOINT}}` / `privatelink.azuredatabricks.net` |
+| Entra ID tenant ID | `{{TENANT_ID}}` |
+| Entra app registration (client ID) | `{{APP_CLIENT_ID}}` |
+| Entra groups mapped to roles | `{{GROUP_CAPS_REVIEWER}}`, `{{GROUP_POLICY_ADMIN}}`, `{{GROUP_ML_ENGINEER}}` |
+| Azure DevOps org / project / repo | `{{ADO_ORG}}` / `{{ADO_PROJECT}}` / `{{ADO_REPO}}` |
+| Azure DevOps service connection | `{{SERVICE_CONNECTION}}` |
+| Resource tags | `{{TAGS}}` |
+
+**Existing database objects:** `{{YES / NO}}`. If yes, I will paste the SQL DDL, a sample Cosmos document and the Databricks table definitions (`SHOW CREATE TABLE`). **Treat them as the source of truth and do not change them without asking.** If no, propose a schema (section 6) for my approval before creating migrations.
+
+---
+
+## 3. Business and system context
+
+- **The clearing process (outside this app):** every night, an automated job reads the day's cheque images and records:
+  - an AI model extracts the cheque fields, and a second document reader is optional;
+  - a signature model compares the signature with the member's specimen;
+  - a rules engine decides **pay / return / review** for each cheque.
+
+  It writes the results to **Azure SQL** (decisions with model, prompt and rules versions; policy; feedback; audit) and to **Cosmos DB** (raw model outputs and evidence packages as JSON).
+- **This app:** reviewers decide the cheques marked **review** before the daily clearing cut-off. Policy administrators manage the rules' thresholds and reason codes. ML engineers look at quality and use reviewer feedback to retrain models.
+  - Sign-in is through **Microsoft Entra ID** with roles.
+  - Personas: **CAPS reviewer**, **policy administrator**, **ML engineer**.
+- **Azure Databricks:** the data platform holds the curated cheque data, clearing history, the image manifest and model metrics as Delta tables in Unity Catalog. It also holds the **labelled data** used to retrain the models. This app reads context and metrics from it and writes reviewer corrections and labels to it.
+- **Writeback to core banking (outside this app):** a separate service reads **final decisions** from Azure SQL and updates the core banking system (T24). It records a writeback status. This app only **reads** that status; it never calls T24.
+- **Governance expectations:**
+  - **Human oversight:** reviewers make the final call on flagged cheques.
+  - **Keyless access:** managed identities, no keys or passwords.
+  - **Network:** private networking.
+  - **Logging:** no cheque content in logs.
+  - **Audit:** a full audit trail per cheque, with a defined retention period.
+- Keep the code container-friendly, so it could also run on Azure Container Apps later if needed.
+
+---
+
+## 4. Technology stack (use this)
+
+- **.NET 10 (LTS)**, **ASP.NET Core**, C#. One deployable app with:
+  - **Blazor Web App (Interactive Server)** for the UI. Use **Fluent UI Blazor** (Microsoft's Fluent 2 components) as the component library, so the app looks and feels like the Microsoft 365 / Entra tools staff already use. Only propose MudBlazor if Fluent UI cannot do something we need.
+  - **ASP.NET Core Web API** (controllers or minimal APIs) under `/api/v1/...` for the policy API and the UI's own data calls. Publish an OpenAPI document.
+- **Azure SQL:** EF Core (SQL Server provider) with `Microsoft.Data.SqlClient`, using Entra authentication through managed identity (`Authentication=Active Directory Default`). Use migrations only if we own the schema.
+- **Cosmos DB:** `Microsoft.Azure.Cosmos` SDK v3 with `DefaultAzureCredential` and **data-plane RBAC**. Account keys stay disabled.
+- **Azure Databricks:** the **Databricks SQL Statement Execution API** (REST, `/api/2.0/sql/statements`) against a **SQL warehouse** (serverless preferred). Call it through a typed `HttpClient` wrapped in a `DatabricksSqlClient` service.
+  - Authenticate with a Microsoft Entra token for the web app's managed identity: `DefaultAzureCredential`, scope `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default` (the Azure Databricks resource). **No personal access tokens.**
+  - Always pass values as **statement parameters** (`:name`) and never concatenate SQL.
+  - Use `INLINE` / `JSON_ARRAY` results for small reads and `EXTERNAL_LINKS` for large exports.
+  - Poll asynchronously with a timeout, and cancel the statement if the caller gives up.
+  - Alternative, only if I approve: the Databricks ODBC driver. It needs a custom container on App Service; explain the trade-off before choosing it.
+- **Auth:** `Microsoft.Identity.Web` (OpenID Connect) with Entra **app roles**, plus policy-based authorization.
+- **Config and secrets:** App Service settings, with Key Vault references only where a secret is unavoidable. Use `Azure.Identity` everywhere.
+- **Telemetry:** Azure Monitor OpenTelemetry Distro sending to Application Insights.
+- **Tests:**
+  - xUnit with FluentAssertions;
+  - Testcontainers (SQL Server) or LocalDB, and the Cosmos DB emulator;
+  - bUnit for components;
+  - Playwright for end-to-end tests.
+- **IaC:** Bicep. **CI/CD:** Azure DevOps YAML pipelines. **Host:** App Service on Linux.
+
+If the App Service runtime stack in our region does not yet offer the .NET patch version we need, fall back to a custom container on App Service. Tell me before doing this.
+
+---
+
+## 5. Users, roles and permissions
+
+| Role (Entra app role) | Can do |
+|---|---|
+| `CapsReviewer` | See the review queue; open a cheque; view evidence; record a final decision (pay / return) with a reason code and comment; correct extracted fields; flag a bad model read. |
+| `PolicyAdmin` | Everything a reviewer can *view*; create, edit and activate **policy versions** (thresholds, rules parameters, reason codes) through the UI and API. Cannot decide cheques unless also a reviewer. |
+| `MlEngineer` | Read-only access to decisions, evidence, model / prompt / rules versions and feedback; download the labelled feedback set; see quality metrics. Cannot decide cheques or change policy. |
+
+- Deny by default. Enforce every rule **on the server** (API and page), not only by hiding UI elements.
+- Record the user's Entra object ID and display name on every write.
+- `{{CONFIRM: is a second approver (four-eyes) required for returns over an amount, or for policy activation?}}`
+
+---
+
+## 6. Data: what the app reads and writes
+
+**Azure SQL is the system of record for decisions.** Cosmos DB holds evidence documents, and Databricks holds history, metrics and retraining labels. Propose exact schemas only if I said we do not have them. The expected shape is:
+
+**Azure SQL (read/write)**
+- `Decision`:
+  - cheque ID, business date, run ID;
+  - model, prompt and rules versions;
+  - automatic outcome, confidence and signature score;
+  - status: `PendingReview`, `InReview`, `Decided`, `SentToWriteback`, `WritebackDone`, `WritebackFailed`;
+  - final outcome, reason code, reviewer and timestamps;
+  - a `rowversion` for optimistic concurrency.
+
+  **One decision per cheque per business date.**
+- `ReviewAssignment` (or lock columns): who claimed the cheque and when the claim expires (for example, 15 minutes).
+- `ReviewerFeedback`: corrected fields (field name, model value, corrected value), signature verdict, free-text comment, and a "bad read" flag.
+- `PolicyVersion` and `PolicyRule`: versioned, with exactly one active version at a time. Activation is an explicit, audited action, and old versions are immutable.
+- `AuditEvent`: **append-only** (who, what, when, cheque or policy ID, before and after values as JSON). The app never updates or deletes these rows.
+- `WritebackStatus`: **read-only** for this app (written by the separate writeback service).
+- `Outbox`: pending writes to Cosmos and Databricks (see "How writes happen").
+
+**Azure Databricks (read/write, Unity Catalog)**
+- **Read** from `{{CATALOG}}.{{READ_SCHEMA}}`:
+  - clearing history for a member account or cheque, shown as context on the cheque detail page;
+  - the curated cheque record and image manifest, when they are not in the Cosmos evidence package;
+  - daily model and quality metrics for the Insights screen.
+
+  These reads are **not** on the queue's critical path. Cache results briefly and set a per-request timeout. If Databricks is slow or down, the page still loads and shows "history unavailable".
+- **Write** to `{{CATALOG}}.{{WRITE_SCHEMA}}`:
+  - Reviewer field corrections, signature verdicts and "bad read" flags go to the **labelled data** table(s) used for retraining.
+  - Each row carries:
+    - cheque ID and business date;
+    - model, prompt and rules versions;
+    - reviewer object ID (pseudonymised if `{{CONFIRM}}`);
+    - the corrected values;
+    - a timestamp.
+  - Use **`MERGE INTO`** keyed by (cheque ID, business date, field, feedback version), so retries never create duplicates.
+  - Never update or delete model outputs or tables the app does not own.
+
+**Cosmos DB**
+- **Read:** evidence packages and raw model outputs, by cheque ID. Use **point reads** (ID plus partition key) wherever possible, and avoid cross-partition queries on hot paths.
+- **Write:** `{{CONFIRM: does the app write to Cosmos (e.g. reviewer annotations on the evidence package), or only read?}}`. If it writes, use idempotent upserts with ETag concurrency, and never overwrite model outputs.
+
+**How writes happen (consistency across the three stores)**
+- There are no distributed transactions. **SQL is authoritative:** the reviewer's save commits the decision, the feedback and an **outbox** row in a single SQL transaction.
+- A background `IHostedService` drains the outbox in small batches to Databricks (`MERGE`) and to Cosmos (if it writes there). Writes are retried with back-off, and failures go to a dead-letter state. Retries must tolerate a SQL warehouse cold start.
+- Never call Databricks inside the reviewer's save request. A Databricks or Cosmos failure must never block or corrupt the SQL decision.
+- Show the sync status for each cheque (`Pending`, `Synced`, `Failed`) to ML engineers.
+- Run a daily reconciliation that compares SQL feedback counts with Databricks row counts per business date, and alert on any mismatch.
+
+**Cheque images**
+- If the evidence package has an image URI, stream the image through the app's backend using the managed identity, which has read-only access to that container.
+- Never send storage URLs or SAS tokens to the browser.
+- Show the signature specimen next to the cheque signature when it is available.
+
+---
+
+## 7. Functional requirements
+
+1. **Review queue** (the default page for reviewers): flagged cheques for a business date, with filters (status, reason, amount range, confidence, branch) and sorting. Show the time left before the **clearing cut-off** `{{CUTOFF_TIME, time zone}}`. Use server-side paging.
+2. **Claim and lock:** opening a cheque claims it, so two reviewers cannot decide the same cheque. Claims expire, and `{{ROLE}}` can release or override them.
+3. **Cheque detail:** shows
+   - the cheque image;
+   - extracted fields with per-field confidence, with low-confidence fields highlighted;
+   - the signature score next to the specimen;
+   - the rule that applied and why, and the automatic outcome;
+   - the model, prompt and rules versions.
+4. **Decide:**
+   - Pay or return, with a mandatory reason code, an optional comment and field corrections.
+   - Save with optimistic concurrency, so a stale `rowversion` gives a clear "someone else changed this" message.
+   - A decided cheque is read-only. `{{ROLE}}` can reopen it through an audited action, but only before writeback.
+5. **Writeback visibility:** show the writeback status and errors per cheque, plus a daily summary. The app never calls T24.
+6. **Policy configuration (UI and API):** list versions, compare two versions, create a draft, validate it (schema and range checks), activate it, and roll back by activating an older version. Everything is audited.
+7. **Policy API** (`/api/v1/policies`):
+   - Endpoints: GET active, GET by version, POST draft, POST activate.
+   - Protect it with Entra, using app roles for both user and application callers, and document it in OpenAPI.
+   - `{{CONFIRM: who calls this API besides the UI — e.g. the nightly rules engine?}}`
+8. **Audit view:** search the audit trail by cheque ID, user or date (read-only).
+9. **Insights (ML engineer):**
+   - daily counts (auto-decided vs reviewed, overrides, misreads) and model metrics from Databricks;
+   - Databricks sync status, with a "retry failed" action;
+   - download of feedback and labels for a date range, using the Statement Execution API's `EXTERNAL_LINKS` for large result sets, streamed through the backend.
+10. **Accessibility and usability:** see section 8. It is a requirement, not a nice-to-have.
+
+---
+
+## 8. User experience and visual design (make it excellent)
+
+The app must look **modern, calm and trustworthy**: a banking-grade tool that reviewers enjoy using all day. Optimise for **speed of a correct decision**, not decoration.
+
+### 8.1 Design system
+- **Tokens:** build on **Fluent 2 design tokens**, themed with our brand: primary `{{BRAND_PRIMARY_HEX}}`, accent `{{BRAND_ACCENT_HEX}}`, logo `{{LOGO_FILE}}`. Define every colour, spacing, radius, shadow and font size as a token in one place. No hard-coded colours or pixel values in components.
+- **Spacing and type:** use a 4 px base grid (4 / 8 / 12 / 16 / 24 / 32) and a small, consistent type scale with the Segoe UI Variable font stack.
+- **Amounts and dates:** show amounts in **tabular figures**, right-aligned and formatted in CAD (`$1,234.56`). Dates use `{{DATE_FORMAT}}` in the Pacific time zone.
+- **Status colours:** pay / return / review / failed must work in both themes. Always pair colour with an **icon and a text label**; never rely on colour alone.
+- **Themes:** light and dark, following the OS setting with a user override. Both must meet contrast requirements.
+- **Environment banner:** show a coloured "DEV" banner, driven by configuration, so later environments can show their own banner and production shows none.
+- **Style guide page:** add a hidden `/design` page, available outside production, that shows every token and component as a living style guide.
+
+### 8.2 Layout and navigation
+- **App shell:**
+  - A collapsible left navigation with **Review queue**, **Decided**, **Policy**, **Audit** and **Insights**. Show only the items the user's role can open.
+  - A top bar containing:
+    - the **business-date picker**;
+    - a **clearing cut-off countdown** that turns amber at `{{N}}` minutes and red at `{{N}}` minutes;
+    - global search by cheque ID;
+    - the user menu, with a role badge and theme switch.
+- **Screen sizes:** design desktop-first for 1366–1920 px wide, and keep it usable at 1280 px and at 200 % browser zoom. Phone layouts are out of scope; tablets are read-only.
+
+### 8.3 Key screens
+
+**Review queue**
+- A dense, fast data grid with sticky headers, row virtualisation, server-side sort and paging, and **saved filters**.
+- Columns: status chip, cheque ID, amount, payee and account (masked), reason flagged, confidence bar, signature score, claimed by, age.
+- Full keyboard navigation (↑ / ↓, Enter to open). Show a live count of remaining items and how many are claimed by others.
+
+**Cheque detail** (the most important screen) uses a split view.
+- **Left: image viewer.** Zoom, pan, rotate, fit-to-width, and contrast / invert to read faded ink. When the document reader returns field coordinates, hovering over a field highlights its **bounding box** on the image.
+- **Right: evidence panel.**
+  - Extracted fields with per-field confidence. Low-confidence fields are highlighted amber and listed first.
+  - The cheque signature side by side with the specimen, with a score gauge.
+  - **"Why this was flagged"** in plain language (the rule and its threshold).
+  - Clearing history from Databricks, in a collapsible section.
+  - Model, prompt and rules versions, in a small "details" area.
+- **Decision bar:** sticky at the bottom, with **Pay** and **Return** buttons, a required reason code, a comment, and inline field corrections. Returns ask for confirmation.
+- After a save, **auto-advance** to the next cheque. **Prefetch** the next cheque's evidence and image so the switch is instant.
+- **Keyboard shortcuts:** `P` pay, `R` return, `N` next, `?` shows all shortcuts.
+
+**Policy**
+- A version list, a **side-by-side diff** of two versions, and an edit form with inline validation.
+- Activating a version opens a dialog that summarises what changes and who approves.
+
+**Audit**
+- A filterable timeline per cheque or per user, with before and after values shown as a readable diff (not raw JSON).
+
+**Insights**
+- KPI tiles: auto-decided %, override rate, misreads, Databricks sync backlog.
+- A few clear charts: trend over time and breakdown by reason. Every chart has a title, labelled axes, accessible colours and a table view.
+
+### 8.4 Interaction quality
+- **Loading:** skeleton loaders, not spinners, for anything over 300 ms.
+- **Empty states:** explain what to do next (for example, "No flagged cheques for 18 Nov – all clear").
+- **Errors:** human-readable, with a correlation ID to quote to support. Never show stack traces.
+- **Confirmations:** non-blocking toasts for success. Irreversible actions need explicit confirmation.
+- **Concurrency:** if someone else changed the cheque, say so clearly and offer to reload. Show a banner before the user's claim expires.
+- **Microcopy:** plain English, sentence case and consistent verbs (*Pay*, *Return*, *Reopen*, *Activate*), with no internal jargon.
+- **Motion:** subtle (150–200 ms), and respect `prefers-reduced-motion`.
+
+### 8.5 Accessibility (required)
+- Meet **WCAG 2.2 AA**:
+  - text contrast of at least 4.5:1;
+  - visible focus rings and a logical tab order;
+  - an accessible name on every control, and screen-reader labels for the grid and the image viewer.
+- Everything must be usable with a keyboard only.
+- Run automated **axe-core** checks in the Playwright suite (zero serious or critical issues), plus a manual screen-reader pass (NVDA) on the queue and detail screens.
+
+### 8.6 Design first, then build
+Before building the screens, produce **wireframes or a clickable prototype** of the queue, cheque detail, policy diff and insights screens. Use realistic **fake** data, never real cheque data. Wait for my approval, then build to match.
+
+---
+
+## 9. Engineering best practices
+
+**Code quality**
+- Turn on nullable reference types, and treat warnings as errors in CI.
+- Use the .NET analyzers with an `.editorconfig`, Central Package Management (`Directory.Packages.props`) and deterministic builds.
+- Keep layers clean:
+  - Domain has no Azure dependencies;
+  - Application holds the use cases and authorization policies;
+  - Infrastructure holds the Azure clients.
+- Keep methods small and names clear. Write ADRs for significant decisions.
+- Use `async` and `CancellationToken` all the way down. Never use `.Result` or `.Wait()`.
+- Use the options pattern with **validation on start-up**, so a missing setting fails at deploy time, not in the middle of the night.
+
+**API design**
+- URL versioning (`/api/v1`), with the OpenAPI document checked in CI.
+- Errors returned as **ProblemDetails (RFC 9457)**; input validation with FluentValidation.
+- **ETags / `If-Match`** for updates, **idempotency keys** on POST, and cursor or keyset paging.
+- The ASP.NET Core rate limiter on the policy API.
+
+**Blazor Server on App Service (important for scale-out)**
+- Design for two or more instances from day one, even though DEV can run on one.
+  - Use **Azure SignalR Service** (Default mode) or ARR affinity, so user connections survive. Recommend one and explain why.
+  - Persist **ASP.NET Core Data Protection** keys to Blob Storage, protected by Key Vault, so sign-in cookies and antiforgery tokens work across instances and slot swaps.
+- Handle reconnects gracefully with a branded reconnect screen, and keep per-user server memory small.
+
+**Performance**
+- EF Core: use `AsNoTracking` for reads, projections (`Select`) instead of whole entities, and compiled queries on the hot path. Index for the queue's filters.
+- Use Cosmos point reads.
+- Use response compression, and serve fingerprinted, cached static assets (`MapStaticAssets`).
+- Budgets:
+  - queue first paint under 1.5 s and cheque detail under 2 s on the corporate network;
+  - a Lighthouse performance score of at least 90 on the app shell.
+
+**Security** (in addition to section 10)
+- Follow **OWASP ASVS Level 2** and the OWASP Top 10.
+- Set security headers: CSP with nonces, `X-Content-Type-Options`, `Referrer-Policy` and `Permissions-Policy`.
+- Run dependency vulnerability scanning, secret scanning and SAST (CodeQL or Azure DevOps Advanced Security) in the pipeline. The build fails on high or critical findings.
+- Pin packages, update them regularly, and produce an SBOM for each build.
+
+**Operations on App Service**
+- Turn on **Always On**, and set the **health check path** to `/health/ready`.
+- Use a **staging deployment slot** with warm-up (`applicationInitialization`) before swapping.
+- Use **feature flags** (Azure App Configuration) to switch new screens on gradually and to turn off Databricks reads quickly if needed.
+- Write the infrastructure so zone redundancy, multiple instances and autoscale can be switched on per environment through parameters. They can stay off in DEV.
+
+**Testing**
+- A test pyramid:
+  - fast unit tests, with 80 % or more coverage of domain and application code;
+  - integration tests for SQL, Cosmos and Databricks;
+  - bUnit component tests;
+  - Playwright end-to-end tests, including axe accessibility checks.
+- API contract tests against the OpenAPI document.
+- A load-test script (Azure Load Testing) at 2× the expected peak, ready to run before go-live.
+
+**Collaboration**
+- Small PRs with a PR template (what, why, screenshots for UI changes, tests). Branch policies require one reviewer and a green build.
+- Conventional Commits, with a changelog generated for each release.
+
+---
+
+## 10. Security and compliance (non-negotiable)
+
+- **Managed identity:** give the web app a **system-assigned managed identity**, with least-privilege access:
+  - **SQL:** a contained database user, with only the tables and procedures the app needs (`db_datareader` / `db_datawriter`, scoped down where possible).
+  - **Cosmos:** the built-in Data Reader role, or Data Contributor only if the app writes, scoped to the database or container.
+  - **Storage:** Storage Blob Data Reader on the images container only.
+  - **Databricks:**
+    - Add the managed identity to the Databricks account and workspace as a **Microsoft Entra ID–managed service principal**, with workspace access only (no admin).
+    - Grant `CAN USE` on the one SQL warehouse.
+    - Unity Catalog grants:
+      - `USE CATALOG`;
+      - `USE SCHEMA` and `SELECT` on the read schema and tables;
+      - `USE SCHEMA`, `SELECT` and `MODIFY` on the write tables only.
+
+      No `ALL PRIVILEGES`, no ownership, and no access to other schemas.
+  - **Key Vault:** Secrets User, only if needed.
+- **No connection strings with passwords, no account keys, no SAS tokens and no Databricks personal access tokens** in code, configuration or pipelines.
+- **Private network:**
+  - App Service VNet integration.
+  - Private endpoints for SQL, Cosmos, Storage and Key Vault, with public network access disabled on those.
+  - **Databricks front-end Private Link**, or an IP access list that allows only the app's outbound path.
+  - Inbound access to the app: `{{INBOUND: internal only via private endpoint / Front Door / App Gateway / access restrictions}}`.
+- **Web hardening:** HTTPS only, TLS 1.2 or later, HSTS, a strict CSP, antiforgery on forms, secure cookies, and no secrets in the browser.
+- **No cheque content or PII in logs or traces:** account numbers, names, amounts and images never appear in logs. Log cheque IDs and correlation IDs only, and add a telemetry processor that scrubs these fields.
+- **Input handling:** validate all input. Use parameterised queries only (EF Core, or Dapper with parameters).
+- **Regions and tags:** Canadian regions only. Apply the resource tags from section 2.
+- **Data retention:** follow `{{RETENTION_POLICY}}`. The app must never delete audit records.
+
+---
+
+## 11. Non-functional requirements
+
+- **Expected load:** `{{N}}` reviewers at the same time and `{{N}}` flagged cheques per day.
+- **Response times:** queue page p95 under 1 s; cheque detail p95 under 2 s, including the image.
+- **Resilience:**
+  - SDK retries plus `Microsoft.Extensions.Http.Resilience` for HTTP calls.
+  - Health checks: `/health/live`, and `/health/ready` checking SQL and Cosmos.
+  - Graceful messages when a data store is unavailable.
+- **Databricks:**
+  - A separate **non-blocking** health check that reports Degraded rather than Unhealthy, so a warehouse cold start never takes the app out of rotation.
+  - A statement timeout of `{{e.g. 30 s}}` for interactive reads.
+  - Log query IDs, not SQL text with values, for troubleshooting.
+- **Cosmos:** track RU usage and alert on throttling (429 responses).
+
+---
+
+## 12. Observability
+
+- **Tracing:** OpenTelemetry traces across UI → API → SQL / Cosmos / Databricks, with a correlation ID per request and per cheque.
+- **Custom events** (no PII): `ChequeClaimed`, `DecisionSaved`, `PolicyActivated`, `ConcurrencyConflict`, `LockExpired`, `DatabricksSyncSucceeded`, `DatabricksSyncFailed`.
+- **Azure Monitor alerts**, defined in Bicep, for:
+  - the 5xx error rate;
+  - p95 latency;
+  - failed dependency calls;
+  - Cosmos 429s;
+  - reviews still pending `{{N}}` minutes before the cut-off;
+  - an outbox write that has been pending longer than `{{N}}` minutes;
+  - reconciliation mismatches.
+
+---
+
+## 13. Infrastructure, CI/CD and repo layout
+
+- **Bicep modules:**
+  - the App Service plan;
+  - the web app: Linux, .NET 10, managed identity, VNet integration, staging slot, app settings;
+  - private endpoints and DNS links;
+  - role assignments;
+  - alerts, and diagnostic settings sending to Log Analytics.
+
+  Create `params/dev.bicepparam` now, structured so other environments only need a new parameter file. Reference the existing shared resources from section 2 as `existing`; do not recreate them.
+- **Databricks setup as code:** Bicep cannot manage Unity Catalog or workspace objects. Use `{{Terraform databricks provider / Databricks CLI / SQL GRANT scripts}}` in the pipeline. Make each of these steps idempotent:
+  - add the service principal;
+  - grant warehouse permission;
+  - apply Unity Catalog grants;
+  - create the write tables (`CREATE TABLE IF NOT EXISTS`), only if we own them.
+- **Azure DevOps YAML:**
+  - **Build stage:** restore, build, test, publish, SBOM and vulnerability scan.
+  - **DEV stage:** deploy the infrastructure, then deploy the app to the staging slot, run smoke tests and swap.
+  - Use stage templates, so QA and production stages, with approval gates, can be added later by reusing the same artifact.
+- **SQL changes:** idempotent migration scripts or a DACPAC, deployed by the pipeline with a deployment identity rather than the app's identity.
+- **Suggested layout:**
+
+```
+/src
+  ChequeReview.Web/            # Blazor UI + API host
+  ChequeReview.Application/    # use cases, validation, authorization policies
+  ChequeReview.Domain/         # entities, enums, rules (no Azure dependencies)
+  ChequeReview.Infrastructure/ # EF Core, Cosmos repository, Databricks SQL client + outbox worker, blob image reader, telemetry
+/tests
+  *.UnitTests, *.IntegrationTests, *.ComponentTests, e2e/
+/infra
+  main.bicep, modules/, params/dev.bicepparam
+/pipelines
+  azure-pipelines.yml, templates/
+/docs
+  architecture.md, runbook.md, decisions/ (ADRs)
+```
+
+---
+
+## 14. How to work: milestones and definition of done
+
+1. **M0 – Plan:** answer section 1 and list your questions and assumptions. Wait for my go-ahead.
+2. **M1 – Skeleton and design:**
+   - Solution structure, analyzers, Entra sign-in with app roles, health checks and telemetry.
+   - A local dev setup: README, `dotnet user-secrets` (local only), the Cosmos emulator and a local SQL instance.
+   - The **design system** (tokens, theme, app shell, `/design` page), plus the **wireframes or prototype** from section 8.6, for my approval.
+3. **M2 – Read path:** the review queue and cheque detail, reading from SQL and Cosmos (including the image), with integration tests.
+4. **M3 – Write path:** claim and lock, decide, corrections and feedback, audit, outbox and concurrency handling. Include tests for conflicts and authorization.
+5. **M4 – Policy:** UI and API, versioning, activate and roll back, OpenAPI.
+6. **M5 – Databricks connector:**
+   - `DatabricksSqlClient` with managed-identity auth, parameterised statements, async polling and timeouts.
+   - The read features (history, metrics).
+   - The outbox worker writing labels with `MERGE`, plus reconciliation.
+   - Integration tests against the DEV warehouse, and unit tests with a mocked REST endpoint.
+7. **M6 – Insights screen** and the label download.
+8. **M7 – Infrastructure and pipeline:** Bicep and Azure DevOps (including Databricks grants as code), deployed to DEV.
+9. **M8 – Hardening:** a security review against section 10, an accessibility check, the load-test script and the runbook.
+
+**Done means:**
+- the build is green, with zero analyzer warnings;
+- unit, integration, component and end-to-end tests pass;
+- axe-core reports no serious or critical accessibility issues;
+- the screens match the approved design in light and dark themes;
+- the performance budgets in section 9 are met;
+- the security scans are clean;
+- there are no secrets in the repo;
+- each role is tested for both allowed **and** denied actions;
+- the logs contain no PII;
+- Bicep deploys cleanly to DEV;
+- the README explains how to run the app locally and how to deploy it.
+
+**Rules for you:**
+- Do not invent resource names, schemas, reason codes or policy fields. Ask me, or add a clearly marked `TODO(confirm)`.
+- Keep the nightly clearing process, the writeback service and T24 out of scope, and mock them in tests.
+- Do not create or alter Databricks tables the app does not own; write only to the tables listed in section 2.
+- After each milestone, summarise what changed, what is left, and any decision I need to make.
